@@ -18,7 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <openssl/bn.h>
-#include <openssl/core_names.h>
+#include "skf_ossl_compat.h"
 #include <openssl/ec.h>
 #include <openssl/evp.h>
 #include <openssl/obj_mac.h>

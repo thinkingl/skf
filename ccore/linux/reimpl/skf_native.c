@@ -31,7 +31,7 @@
 #include <openssl/ecdsa.h>
 #include <openssl/obj_mac.h>
 #include <openssl/x509.h>
-#include <openssl/core_names.h>
+#include "skf_ossl_compat.h"
 
 #include "skf.h"
 

@@ -105,6 +105,11 @@ For arm64, build with an aarch64 `libcrypto`:
 make -C linux native-arm64
 ```
 
+The OpenSSL-dependent tools support both OpenSSL 1.x and 3.x through
+[`linux/include/skf/skf_ossl_compat.h`](linux/include/skf/skf_ossl_compat.h).
+No extra build flags are needed: OpenSSL 3.x uses the native provider APIs,
+while 1.x automatically falls back to the classic `EC_KEY` accessors.
+
 Standard RSA wrapped-key and ECC `ENVELOPEDKEYBLOB` import formats are
 supported when the container already has a software-imported private key.
 Known limitations: importing a standard envelope into a device-generated
