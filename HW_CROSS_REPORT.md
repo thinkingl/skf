@@ -2,7 +2,7 @@
 
 - 日期：2026-11-05
 - 硬件：C*Core CCM3302（序列号已隐藏），USB `02e3:0702`
-- 硬件库：`../ccore/linux/lib/libskf.so`
+- 硬件库：厂商 `libskf.so`（本机为 `../ccore/linux/lib/libskf.so`）
 - 软库：`./libsoftskf.so`
 - 硬件应用：`KEDA`，USER PIN `123456`
 - 软令牌：`/tmp/softskf-xval/softskf0`，`KEDA`，USER PIN `123456`
@@ -66,7 +66,7 @@ export SOFTSKF_HOME=/tmp/softskf-xval
 
 make hw-cross
 sudo env SOFTSKF_HOME=/tmp/softskf-xval ./tests/hw_cross_test \
-  ../ccore/linux/lib/libskf.so ./libsoftskf.so
+  /path/to/vendor/libskf.so ./libsoftskf.so
 ```
 
 硬件库需要 root 或 `CAP_SYS_RAWIO`；程序只做读取、验签、签名、加解密和锁测试，
