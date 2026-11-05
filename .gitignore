@@ -1,10 +1,2 @@
-libsoftskf.so
-softskf-init
-tests/softskf_test
-tests/softskf_admin_test
-tests/skf_all
-tests/skf_imports_test
-tests/hw_cross_test
+.DS_Store
 report.md
-*.o
-*.d

@@ -1,0 +1,3 @@
+# C*Core USB Key 02e3:0702 (USB mass storage / vendor SCSI SKF token)
+SUBSYSTEM=="block", KERNEL=="sd*", ATTRS{idVendor}=="02e3", ATTRS{idProduct}=="0702", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="scsi_generic", KERNEL=="sg*", ATTRS{idVendor}=="02e3", ATTRS{idProduct}=="0702", GROUP="plugdev", MODE="0660"
