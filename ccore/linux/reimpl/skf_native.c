@@ -31,6 +31,7 @@
 #include <openssl/ecdsa.h>
 #include <openssl/obj_mac.h>
 #include <openssl/x509.h>
+#include <openssl/core_names.h>
 
 #include "skf.h"
 
@@ -77,6 +78,21 @@ typedef struct ctn_ctx {
     char name[64];
 } CTN_CTX;
 
+static void ctn_clear_ecc(CTN_CTX *c)
+{
+    c->ecc_priv_valid = 0;
+    memset(c->ecc_priv, 0, sizeof(c->ecc_priv));
+    memset(&c->ecc_pub_soft, 0, sizeof(c->ecc_pub_soft));
+}
+
+static void ctn_clear_rsa(CTN_CTX *c)
+{
+    free(c->rsa_priv_soft);
+    c->rsa_priv_soft = NULL;
+    c->rsa_bits = 0;
+    memset(c->rsa_mod, 0, sizeof(c->rsa_mod));
+}
+
 typedef struct key_ctx {
     DEV_CTX *dev;
     unsigned long alg;
@@ -102,6 +118,8 @@ static void put_be32(unsigned char *p, unsigned long v)
 static ULONG raw_rsa(const BYTE *mod, const BYTE *exp, ULONG bits,
                      BYTE *in, ULONG len, BYTE *out, ULONG *outlen);
 static ULONG write_selected(DEV_CTX *d, const BYTE *data, ULONG len);
+static void rev_words32(const unsigned char in[32], unsigned char out[32]);
+static ULONG fci_size(const unsigned char *buf, unsigned long len, ULONG *size);
 static ULONG delete_ef(DEV_CTX *d, unsigned short file);
 static ULONG pin_verify(DEV_CTX *d, unsigned short app_id, ULONG type,
                         const char *pin, ULONG *retry);
@@ -227,6 +245,9 @@ static ULONG apdu_ext(DEV_CTX *d, const unsigned char *cmd, unsigned long clen,
         sw = (unsigned short)((resp[16 + total - 2] << 8) | resp[16 + total - 1]);
         dlen = total - 2;
     }
+    if (getenv("SKF_DEBUG"))
+        fprintf(stderr, "apdu sw=%04x cmd=%02x%02x dlen=%lu\n",
+                sw, cmd[0], cmd[1], dlen);
     if (sw != 0x9000) {
         if (sw == 0x6a82 || sw == 0x6a83)
             return SAR_FILE_NOT_EXIST;
@@ -298,30 +319,47 @@ static ULONG read_file(DEV_CTX *d, unsigned short file, unsigned long off,
 {
     unsigned char cmd[512];
     unsigned char tmp[512];
-    unsigned long want = *len;
+    unsigned long want = *len, total = 0;
     ULONG rc;
 
-    if (want > 0x1e8)
-        want = 0x1e8;
     rc = select_file(d, file, 2);
     if (rc != SAR_OK)
         return rc;
-    memset(cmd, 0, sizeof(cmd));
-    cmd[0] = 0x00; cmd[1] = 0xb0;
-    cmd[2] = (unsigned char)(off >> 8);
-    cmd[3] = (unsigned char)off;
-    put_be32(cmd + 4, want);
-    /* The vendor frame carries a read buffer after the 8-byte APDU. */
-    rc = apdu(d, cmd, 8 + want, tmp, &want);
-    if (getenv("SKF_DEBUG"))
-        fprintf(stderr, "read_file %04x rc=%lx len=%lu first=%02x%02x\n",
-                file, (unsigned long)rc, want, tmp[0], tmp[1]);
-    if (rc == SAR_OK) {
-        if (want > *len)
-            want = *len;
-        memcpy(buf, tmp, want);
-        *len = want;
+    while (total < want) {
+        unsigned long chunk = want - total;
+        unsigned long got;
+        unsigned long pos = off + total;
+        if (chunk > 0x1c1)
+            chunk = 0x1c1;
+        memset(cmd, 0, sizeof(cmd));
+        cmd[0] = 0x00; cmd[1] = 0xb0;
+        cmd[2] = (unsigned char)(pos >> 8);
+        cmd[3] = (unsigned char)pos;
+        put_be32(cmd + 4, chunk);
+        got = chunk;
+        /* The vendor frame carries a read buffer after the 8-byte APDU. */
+        rc = apdu(d, cmd, 8 + chunk, tmp, &got);
+        if (getenv("SKF_DEBUG"))
+            fprintf(stderr, "read_file %04x off=%lu rc=%lx len=%lu\n",
+                    file, pos, (unsigned long)rc, got);
+        if (rc != SAR_OK) {
+            /* Reading at/past EOF makes the device return an error.  If
+             * data was already read, return it as a short file. */
+            if (total > 0)
+                rc = SAR_OK;
+            break;
+        }
+        if (got > chunk)
+            got = chunk;
+        if (got == 0)
+            break;
+        memcpy(buf + total, tmp, got);
+        total += got;
+        if (got < chunk)
+            break;
     }
+    if (rc == SAR_OK)
+        *len = total;
     return rc;
 }
 
@@ -672,8 +710,8 @@ ULONG SKF_GenRandom(DEVHANDLE hDev, BYTE *buf, ULONG len)
     while (done < len) {
         unsigned long chunk = len - done;
         unsigned long outlen;
-        if (chunk > 0x1e8)
-            chunk = 0x1e8;
+        if (chunk > 0x1c1)
+            chunk = 0x1c1;
         unsigned char rcmd[512];
         memset(rcmd, 0, sizeof(rcmd));
         rcmd[0] = 0x00; rcmd[1] = 0x84;
@@ -1261,6 +1299,11 @@ static ULONG create_ef_len(DEV_CTX *d, unsigned short file,
     cmd[3] = (unsigned char)file;
     put_be32(cmd + 4, alen);
     memcpy(cmd + 8, attrs, alen);
+    if (getenv("SKF_DEBUG")) {
+        fprintf(stderr, "create_ef %04x alen=%lu attrs=", file, alen);
+        for (unsigned long i = 0; i < alen; i++) fprintf(stderr, "%02x", attrs[i]);
+        fprintf(stderr, "\n");
+    }
     return apdu(d, cmd, 8 + alen, NULL, NULL);
 }
 
@@ -1829,20 +1872,47 @@ ULONG SKF_CloseContainer(HCONTAINER hCtn)
 ULONG SKF_GetContainerType(HCONTAINER hCtn, ULONG *type)
 {
     CTN_CTX *c = (CTN_CTX *)hCtn;
+    unsigned char fci[128];
+    unsigned long flen = sizeof(fci);
+    ULONG size = 0;
     if (!c || !type)
         return SAR_INVALIDHANDLEERR;
-    *type = c->type;
+    /* Vendor convention: 0 = empty container, 1 = RSA, 2 = ECC.
+     * The type follows the key file, not the container slot. */
+    *type = 0;
+    select_app(c->app->dev, c->app->id);
+    ULONG rc = select_file_data(c->app->dev, c->key_file, 2, fci, &flen);
+    if (rc == SAR_FILE_NOT_EXIST)
+        return SAR_OK;
+    if (rc != SAR_OK)
+        return rc;
+    if (fci_size(fci, flen, &size) != SAR_OK)
+        return SAR_FAIL;
+    *type = (size == 0x68) ? 2 : 1;
     return SAR_OK;
 }
 
 static ULONG write_selected(DEV_CTX *d, const BYTE *data, ULONG len)
 {
     unsigned char cmd[512];
-    memset(cmd, 0, sizeof(cmd));
-    cmd[0] = 0x00; cmd[1] = 0xd6;
-    put_be32(cmd + 4, len);
-    memcpy(cmd + 8, data, len);
-    return apdu(d, cmd, 8 + len, NULL, NULL);
+    unsigned long total = 0;
+    while (total < len) {
+        unsigned long chunk = len - total;
+        ULONG rc;
+        if (chunk > 0x1c1)
+            chunk = 0x1c1;
+        memset(cmd, 0, sizeof(cmd));
+        cmd[0] = 0x00; cmd[1] = 0xd6;
+        cmd[2] = (unsigned char)(total >> 8);
+        cmd[3] = (unsigned char)total;
+        put_be32(cmd + 4, chunk);
+        memcpy(cmd + 8, data + total, chunk);
+        rc = apdu(d, cmd, 8 + chunk, NULL, NULL);
+        if (rc != SAR_OK)
+            return rc;
+        total += chunk;
+    }
+    return SAR_OK;
 }
 
 static ULONG create_ef(DEV_CTX *d, unsigned short file,
@@ -2233,8 +2303,8 @@ ULONG SKF_ReadFile(HAPPLICATION hApp, LPSTR name, ULONG off, ULONG len,
         unsigned long chunk = len - done;
         if (off + done > 0xffff)
             return SAR_INVALIDPARAMERR;
-        if (chunk > 0x1e8)
-            chunk = 0x1e8;
+        if (chunk > 0x1c1)
+            chunk = 0x1c1;
         if (chunk > *outlen - done)
             chunk = *outlen - done;
         if (chunk == 0)
@@ -2273,8 +2343,8 @@ ULONG SKF_WriteFile(HAPPLICATION hApp, LPSTR name, ULONG off,
         unsigned long chunk = len - done;
         if (off + done > 0xffff)
             return SAR_INVALIDPARAMERR;
-        if (chunk > 0x1e8)
-            chunk = 0x1e8;
+        if (chunk > 0x1c1)
+            chunk = 0x1c1;
         unsigned char cmd[512];
         memset(cmd, 0, sizeof(cmd));
         cmd[0] = 0x00; cmd[1] = 0xd6;
@@ -2731,33 +2801,53 @@ ULONG SKF_CloseHandle(HANDLE h)
     return SAR_INVALIDHANDLEERR;
 }
 
+/* Per-container certificate EFs:
+ *   0x1401 + (slot - 0x1101)  encryption certificate
+ *   0x1501 + (slot - 0x1101)  signing certificate
+ * This matches the vendor library and SKF_DeleteContainer(). */
+static unsigned short cert_ef(const CTN_CTX *c, BOOL sign)
+{
+    unsigned short slot = c->file_id;
+    if (slot < 0x1101 || slot > 0x1105)
+        slot = 0x1101;
+    return (unsigned short)((sign ? 0x1501 : 0x1401) + (slot - 0x1101));
+}
+
 ULONG SKF_ExportCertificate(HCONTAINER hCtn, BOOL sign, BYTE *cert, ULONG *len)
 {
     CTN_CTX *c = (CTN_CTX *)hCtn;
-    unsigned char buf[512], fci[256];
-    unsigned long n = 0, flen = sizeof(fci);
+    unsigned char fci[256];
+    unsigned char *buf = NULL;
+    unsigned long flen = sizeof(fci);
+    unsigned long n = 0;
     unsigned short file;
     ULONG rc, size = 0;
     if (!c || !c->app || !c->app->dev || !cert || !len)
         return SAR_INVALIDPARAMERR;
-    file = sign ? 0x1502 : 0x1501;
+    select_app(c->app->dev, c->app->id);
+    select_file(c->app->dev, c->key_file, 2);
+    file = cert_ef(c, sign);
     rc = select_file_data(c->app->dev, file, 0, fci, &flen);
     if (rc != SAR_OK)
-        return rc;
-    if (fci_size(fci, flen, &size) != SAR_OK)
+        return rc == SAR_FILE_NOT_EXIST ? SAR_CERTNOTFOUNTERR : rc;
+    if (fci_size(fci, flen, &size) != SAR_OK || size == 0)
         size = *len;
+    if (size > *len) {
+        *len = size;
+        return SAR_BUFFER_TOO_SMALL;
+    }
+    buf = malloc(size);
+    if (!buf)
+        return SAR_MEMORYERR;
     n = size;
-    if (n > *len)
-        n = *len;
-    if (n > sizeof(buf))
-        n = sizeof(buf);
     rc = read_file(c->app->dev, file, 0, buf, &n);
-    if (rc != SAR_OK)
+    if (rc != SAR_OK) {
+        free(buf);
         return rc;
-    if (n > *len)
-        n = *len;
+    }
     memcpy(cert, buf, n);
     *len = (ULONG)n;
+    free(buf);
     return SAR_OK;
 }
 static void cert_coord32(const unsigned char *coord, unsigned char out[32])
@@ -2768,6 +2858,8 @@ static void cert_coord32(const unsigned char *coord, unsigned char out[32])
     memcpy(out, coord + (nz ? 0 : 32), 32);
 }
 
+static ULONG ecc_pub_bytes(CTN_CTX *c, BOOL sign, unsigned char out[64]);
+
 static int cert_key_matches(CTN_CTX *c, BOOL sign,
                             const unsigned char *cert, ULONG len)
 {
@@ -2777,6 +2869,14 @@ static int cert_key_matches(CTN_CTX *c, BOOL sign,
         return 0;
     EVP_PKEY *pk = X509_get_pubkey(x);
     int ok = 0;
+    if (!pk) {
+        X509_free(x);
+        return 0;
+    }
+    if (getenv("SKF_DEBUG"))
+        fprintf(stderr, "cert_key_matches: pkey=%p id=%d rsa_soft=%p rsa_bits=%lu ecc=%d\n",
+                (void *)pk, pk ? EVP_PKEY_base_id(pk) : -1,
+                (void *)c->rsa_priv_soft, c->rsa_bits, c->ecc_priv_valid);
     if (pk && (c->rsa_priv_soft || c->rsa_bits)) {
         RSA *r = EVP_PKEY_get1_RSA(pk);
         if (r) {
@@ -2798,24 +2898,64 @@ static int cert_key_matches(CTN_CTX *c, BOOL sign,
             }
             RSA_free(r);
         }
-    } else if (pk && c->ecc_priv_valid) {
-        EC_KEY *k = EVP_PKEY_get1_EC_KEY(pk);
-        if (k) {
-            const EC_GROUP *g = EC_KEY_get0_group(k);
-            const EC_POINT *pt = EC_KEY_get0_public_key(k);
-            BIGNUM *xbn = BN_new(), *ybn = BN_new();
-            unsigned char cx[32], cy[32], ax[32], ay[32];
-            if (xbn && ybn &&
-                EC_POINT_get_affine_coordinates(g, pt, xbn, ybn, NULL) == 1) {
-                BN_bn2binpad(xbn, cx, 32);
-                BN_bn2binpad(ybn, cy, 32);
+    } else {
+        BIGNUM *xbn = NULL, *ybn = NULL;
+        unsigned char cx[32], cy[32], ax[32], ay[32];
+        int coord = 0;
+        int gx = EVP_PKEY_get_bn_param(pk, OSSL_PKEY_PARAM_EC_PUB_X, &xbn);
+        int gy = EVP_PKEY_get_bn_param(pk, OSSL_PKEY_PARAM_EC_PUB_Y, &ybn);
+        if (getenv("SKF_DEBUG"))
+            fprintf(stderr, "cert_key_matches: getx=%d gety=%d\n", gx, gy);
+        if (gx == 1 && gy == 1) {
+            BN_bn2binpad(xbn, cx, 32);
+            BN_bn2binpad(ybn, cy, 32);
+            coord = 1;
+        } else {
+            EC_KEY *k = EVP_PKEY_get1_EC_KEY(pk);
+            if (k) {
+                const EC_GROUP *g = EC_KEY_get0_group(k);
+                const EC_POINT *pt = EC_KEY_get0_public_key(k);
+                BN_free(xbn);
+                BN_free(ybn);
+                xbn = BN_new(); ybn = BN_new();
+                if (xbn && ybn && g && pt &&
+                    EC_POINT_get_affine_coordinates(g, pt, xbn, ybn,
+                                                    NULL) == 1) {
+                    BN_bn2binpad(xbn, cx, 32);
+                    BN_bn2binpad(ybn, cy, 32);
+                    coord = 1;
+                }
+                EC_KEY_free(k);
+            }
+        }
+        if (coord) {
+            if (getenv("SKF_DEBUG"))
+                fprintf(stderr, "cert EC cx=%02x%02x cy=%02x%02x ecc=%d\n",
+                        cx[0], cx[1], cy[0], cy[1], c->ecc_priv_valid);
+            if (c->ecc_priv_valid) {
                 cert_coord32(c->ecc_pub_soft.XCoordinate, ax);
                 cert_coord32(c->ecc_pub_soft.YCoordinate, ay);
-                ok = memcmp(cx, ax, 32) == 0 && memcmp(cy, ay, 32) == 0;
+                ok = memcmp(cx, ax, 32) == 0 &&
+                     memcmp(cy, ay, 32) == 0;
+                if (getenv("SKF_DEBUG"))
+                    fprintf(stderr, "software EC ax=%02x%02x ay=%02x%02x ok=%d\n",
+                            ax[0], ax[1], ay[0], ay[1], ok);
+            } else {
+                unsigned char xy[64];
+                ULONG erc = ecc_pub_bytes(c, sign, xy);
+                if (erc == SAR_OK) {
+                    rev_words32(xy, ax);
+                    rev_words32(xy + 32, ay);
+                    ok = memcmp(cx, ax, 32) == 0 &&
+                         memcmp(cy, ay, 32) == 0;
+                    if (getenv("SKF_DEBUG"))
+                        fprintf(stderr, "device EC ax=%02x%02x ay=%02x%02x ok=%d\n",
+                                ax[0], ax[1], ay[0], ay[1], ok);
+                }
             }
-            BN_free(xbn); BN_free(ybn);
-            EC_KEY_free(k);
         }
+        BN_free(xbn);
+        BN_free(ybn);
     }
     EVP_PKEY_free(pk);
     X509_free(x);
@@ -2836,10 +2976,11 @@ ULONG SKF_ImportCertificate(HCONTAINER hCtn, BOOL sign, BYTE *cert, ULONG len)
         return SAR_INDATAERR;
     if (!cert_key_matches(c, sign, cert, len))
         return SAR_OBJERR;
-    file = sign ? 0x1502 : 0x1501;
+    file = cert_ef(c, sign);
     attr[6] = (unsigned char)(len >> 8);
     attr[7] = (unsigned char)len;
     select_app(c->app->dev, c->app->id);
+    select_file(c->app->dev, c->key_file, 2);
     delete_ef(c->app->dev, file);
     rc = create_ef_len(c->app->dev, file, attr, sizeof(attr));
     if (rc != SAR_OK)
@@ -2856,13 +2997,17 @@ static ULONG ecc_pub_bytes(CTN_CTX *c, BOOL sign, unsigned char out[64])
     unsigned long n = sizeof(buf);
     ULONG rc;
     (void)sign;
-    select_file(c->app->dev, c->key_file, 2);
+    rc = select_file(c->app->dev, c->key_file, 2);
+    if (rc != SAR_OK)
+        return rc == SAR_FILE_NOT_EXIST ? SAR_KEYNOTFOUNTERR : rc;
     memset(cmd, 0, sizeof(cmd));
     cmd[0] = 0x80; cmd[1] = 0x57;
     put_be32(cmd + 4, 0x40);
     rc = apdu(c->app->dev, cmd, sizeof(cmd), buf, &n);
-    if (rc != SAR_OK || n < 64)
-        return rc == SAR_OK ? SAR_FAIL : rc;
+    if (rc != SAR_OK)
+        return rc == SAR_FILE_NOT_EXIST ? SAR_KEYNOTFOUNTERR : rc;
+    if (n < 64)
+        return SAR_FAIL;
     memcpy(out, buf, 64);
     return SAR_OK;
 }
@@ -2875,6 +3020,11 @@ ULONG SKF_ExportPublicKey(HCONTAINER hCtn, BOOL sign, BYTE *blob, ULONG *len)
     ULONG rc;
     if (!c || !blob || !len || *len < sizeof(ECCPUBLICKEYBLOB))
         return SAR_INVALIDPARAMERR;
+    if (c->ecc_priv_valid) {
+        memcpy(pub, &c->ecc_pub_soft, sizeof(*pub));
+        *len = sizeof(*pub);
+        return SAR_OK;
+    }
     rc = ecc_pub_bytes(c, sign, xy);
     if (rc != SAR_OK)
         return rc;
@@ -2913,6 +3063,8 @@ ULONG SKF_GenECCKeyPair(HCONTAINER hCtn, ULONG alg, ECCPUBLICKEYBLOB *blob)
     blob->BitLen = 256;
     rev_words32(buf, blob->XCoordinate + 32);
     rev_words32(buf + 32, blob->YCoordinate + 32);
+    ctn_clear_ecc(c);
+    ctn_clear_rsa(c);
     return SAR_OK;
 }
 ULONG SKF_GenRSAKeyPair(HCONTAINER hCtn, ULONG bits, RSAPUBLICKEYBLOB *blob)
@@ -2952,6 +3104,9 @@ ULONG SKF_GenRSAKeyPair(HCONTAINER hCtn, ULONG bits, RSAPUBLICKEYBLOB *blob)
         blob->Modulus[MAX_RSA_MODULUS_LEN - 1 - i] = buf[i];
     blob->PublicExponent[0] = 0x00; blob->PublicExponent[1] = 0x01;
     blob->PublicExponent[2] = 0x00; blob->PublicExponent[3] = 0x01;
+    ctn_clear_ecc(c);
+    free(c->rsa_priv_soft);
+    c->rsa_priv_soft = NULL;
     return SAR_OK;
 }
 ULONG SKF_ImportECCKeyPair(HCONTAINER hCtn, ENVELOPEDKEYBLOB *blob)
@@ -3003,6 +3158,7 @@ ULONG SKF_ImportECCKeyPair(HCONTAINER hCtn, ENVELOPEDKEYBLOB *blob)
         }
         if (!found)
             return SAR_INVALIDPARAMERR;
+        ctn_clear_rsa(c);
         c->ecc_pub_soft = blob->PubKey;
         c->ecc_priv_valid = 1;
         return SAR_OK;
@@ -3125,6 +3281,7 @@ ULONG SKF_ImportRSAKeyPair(HCONTAINER hCtn, ULONG bits, BYTE *pri, ULONG prilen,
         c->rsa_bits = copy->BitLen;
         memset(c->rsa_mod, 0, sizeof(c->rsa_mod));
         memcpy(c->rsa_mod, copy->Modulus, sizeof(c->rsa_mod));
+        ctn_clear_ecc(c);
         return SAR_OK;
     }
 
@@ -3143,6 +3300,7 @@ ULONG SKF_ImportRSAKeyPair(HCONTAINER hCtn, ULONG bits, BYTE *pri, ULONG prilen,
     c->rsa_bits = b->BitLen;
     memset(c->rsa_mod, 0, sizeof(c->rsa_mod));
     memcpy(c->rsa_mod, b->Modulus, sizeof(c->rsa_mod));
+    ctn_clear_ecc(c);
     return SAR_OK;
 }
 
@@ -3322,6 +3480,13 @@ ULONG SKF_ECCSignData(HCONTAINER hCtn, BYTE *digest, ULONG len, ECCSIGNATUREBLOB
     ULONG rc;
     if (!c || !digest || !sig || len != 32)
         return SAR_INVALIDPARAMERR;
+    if (c->ecc_priv_valid) {
+        memset(sig, 0, sizeof(*sig));
+        if (sm2_sign_digest(c->ecc_priv, digest,
+                            sig->r + 32, sig->s + 32) != 0)
+            return SAR_FAIL;
+        return SAR_OK;
+    }
     if (getenv("SKF_DEBUG"))
         fprintf(stderr, "sign: user_pin='%s' logged=%d keyfile=%04x\n",
                 c->app->dev->user_pin, c->app->dev->user_logged, c->key_file);

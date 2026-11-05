@@ -40,3 +40,6 @@ linux/reimpl/capture_devauth_reorig
 linux/skf_lock_test
 linux/skf_ext_ecc_test
 linux/skf_session_ecc_test
+linux/skf_cert_check
+linux/skf_cert_diff
+linux/skf_cert_regress
